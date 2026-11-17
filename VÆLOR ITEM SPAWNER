@@ -1,0 +1,1683 @@
+local M = {
+    version = "5.2", dead = false, generation = 0, mining = false, scanning = false, deepScanning = false,
+    connections = {}, rows = {}, workers = {}, entries = {}, catalog = {}, observed = {},
+    categories = {}, logs = {}, filter = "All tools", category = "", query = "",
+    page = 1, pageSize = 36, selected = nil, busy = nil, nextRequest = 0,
+    source = "Not mined", coverage = "Not mined", rawConfig = nil, remoteTree = nil, deepStats = {},
+    handoffDonorName = nil, lastIncomingOffer = nil,
+    colors = {
+        bg = Color3.fromRGB(18, 22, 28), panel = Color3.fromRGB(26, 32, 40),
+        row = Color3.fromRGB(33, 41, 51), active = Color3.fromRGB(44, 72, 91),
+        text = Color3.fromRGB(232, 241, 248), muted = Color3.fromRGB(148, 167, 181),
+        accent = Color3.fromRGB(136, 211, 237), good = Color3.fromRGB(137, 218, 175),
+        bad = Color3.fromRGB(237, 149, 149), line = Color3.fromRGB(60, 76, 91)
+    }
+}
+
+-- BEGIN CATALOG LOGIC (also exercised by the offline validation harness)
+function M.nonempty(value)
+    return type(value) == "string" and value ~= ""
+end
+
+function M.icon(value)
+    if type(value) == "number" or (type(value) == "string" and value:match("^%d+$")) then
+        return "rbxassetid://" .. tostring(value)
+    end
+    return type(value) == "string" and value or ""
+end
+
+function M.key(value)
+    return tostring(value):gsub("%s+", "-"):upper()
+end
+
+function M.configPath(root, path)
+    local node = root
+    for segment in tostring(path):gmatch("[^/]+") do
+        if type(node) ~= "table" then return nil end
+        local nextNode = node[segment]
+        if nextNode == nil then
+            for key, value in pairs(node) do
+                if type(key) == "string" and M.key(key) == M.key(segment) then
+                    nextNode = value
+                    break
+                end
+            end
+        end
+        if nextNode == nil then return nil end
+        node = nextNode
+    end
+    return node
+end
+
+function M.findConfig(packages, defaultPackage)
+    if type(packages) ~= "table" then return nil end
+    local roots, seen = {}, {}
+    local function add(name, value)
+        if type(value) == "table" and not seen[value] then
+            seen[value] = true
+            roots[#roots + 1] = {name = name, value = value}
+        end
+    end
+    add("brookhaven", packages.brookhaven)
+    for key, value in pairs(packages) do
+        if type(key) == "string" and key:lower() == "brookhaven" then add(key, value) end
+    end
+    if type(defaultPackage) == "string" then add(defaultPackage, packages[defaultPackage]) end
+    local keys = {}
+    for key in pairs(packages) do keys[#keys + 1] = key end
+    table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
+    for _, key in ipairs(keys) do add(tostring(key), packages[key]) end
+    add("root", packages)
+    for _, candidate in ipairs(roots) do
+        local config = M.configPath(candidate.value, "Tools/Config")
+        if type(config) == "table" then return config, candidate.name end
+    end
+    return nil
+end
+
+function M.filterText(value)
+    if type(value) == "string" then return value end
+    local out = {}
+    if type(value) == "table" then
+        for key, item in pairs(value) do
+            if type(item) == "string" then out[#out + 1] = item
+            elseif item == true and type(key) == "string" then out[#out + 1] = key end
+        end
+    end
+    table.sort(out)
+    return table.concat(out, ", ")
+end
+
+function M.parseConfig(config, source)
+    local entries, categories, stats = {}, {}, {rows = 0, tools = 0, categories = 0, skipped = 0, duplicates = 0}
+    if type(config) ~= "table" then return entries, categories, stats end
+    local keys = {}
+    for key in pairs(config) do keys[#keys + 1] = key end
+    table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
+    for _, key in ipairs(keys) do
+        local raw = config[key]
+        stats.rows = stats.rows + 1
+        if type(raw) == "table" then
+            local name = M.nonempty(raw.Name) and raw.Name or (type(key) == "string" and key or nil)
+            if name and name ~= "" and name ~= "ClearTools" then
+                if entries[name] then
+                    stats.duplicates = stats.duplicates + 1
+                else
+                    local isCategory = raw.IsCategory == true
+                    local gun = M.nonempty(raw.GunSkin) and raw.GunSkin or nil
+                    local item = M.nonempty(raw.Item) and raw.Item or nil
+                    local requirement = raw.RequirementBehaviorData
+                    local e = {
+                        name = name, displayName = M.nonempty(raw.DisplayName) and raw.DisplayName or name,
+                        category = M.nonempty(raw.Category) and raw.Category or "",
+                        icon = M.icon(raw.Icon or raw.IconWhenUnlocked),
+                        order = tonumber(raw.Order) or 0, isCategory = isCategory,
+                        kind = isCategory and "Category" or (gun and "Gun skin" or "Tool"),
+                        route = not isCategory and (gun and "GunEquip" or "PickingTools") or nil,
+                        gunSkin = gun, item = item, filters = M.filterText(raw.Filter),
+                        requirement = type(requirement) == "table" and tostring(requirement.Behavior or "Configured") or "",
+                        hiddenUnlessUnlocked = raw.HiddenUnlessUnlocked == true,
+                        source = source, raw = raw, catalog = true
+                    }
+                    entries[name] = e
+                    if isCategory then
+                        categories[name] = e
+                        stats.categories = stats.categories + 1
+                    else stats.tools = stats.tools + 1 end
+                end
+            else stats.skipped = stats.skipped + 1 end
+        else stats.skipped = stats.skipped + 1 end
+    end
+    return entries, categories, stats
+end
+
+function M.categoryPath(entry, categories)
+    local parts, seen, current = {}, {}, entry.category
+    while current and current ~= "" and not seen[current] do
+        seen[current] = true
+        table.insert(parts, 1, categories[current] and categories[current].displayName or current)
+        current = categories[current] and categories[current].category or nil
+    end
+    return #parts > 0 and table.concat(parts, " / ") or "General"
+end
+
+function M.inCategory(entry, wanted, categories)
+    if wanted == "" then return true end
+    local seen, current = {}, entry.category
+    if entry.isCategory and entry.name == wanted then return true end
+    while current and current ~= "" and not seen[current] do
+        if current == wanted then return true end
+        seen[current] = true
+        current = categories[current] and categories[current].category or nil
+    end
+    return false
+end
+
+function M.matches(entry, query)
+    local haystack = table.concat({entry.name, entry.displayName, entry.kind, entry.category,
+        entry.categoryPath or "", entry.filters or "", entry.item or "", entry.source or ""}, " "):lower()
+    for word in query:lower():gmatch("%S+") do
+        if not haystack:find(word, 1, true) then return false end
+    end
+    return true
+end
+
+function M.requestArgs(entry)
+    if entry.isCategory then return nil end
+    if entry.route == "GunEquip" and M.nonempty(entry.gunSkin) then
+        return "Remotes.GunEquip", {entry.gunSkin, entry.name}
+    end
+    if entry.route == "PickingTools" then
+        return "RE.1Too1l", {"PickingTools", entry.name}
+    end
+    return nil
+end
+
+function M.actionDecision(entry, intent, present, busy)
+    if entry.isCategory then return "category" end
+    if intent == "hold" and present then return "hold" end
+    if intent == "get" and present then return "owned" end
+    if intent == "remove" and not present then return "absent" end
+    if busy then return "busy" end
+    if M.requestArgs(entry) then return "request" end
+    if (intent == "get" or intent == "hold") and entry.interactions and #entry.interactions > 0 then return "interaction" end
+    return "unavailable"
+end
+-- END CATALOG LOGIC
+
+M.Players = game:GetService("Players")
+M.RS = game:GetService("ReplicatedStorage")
+M.Input = game:GetService("UserInputService")
+M.Http = game:GetService("HttpService")
+M.Tags = game:GetService("CollectionService")
+M.Player = M.Players.LocalPlayer
+if not M.Player then error("Tool Miner must run on the client.") end
+M.PlayerGui = M.Player:WaitForChild("PlayerGui", 15)
+if not M.PlayerGui then error("Tool Miner: PlayerGui was not available.") end
+M.env = (type(getgenv) == "function" and getgenv()) or _G
+if type(M.env.ToolMinerSpawnerUnload) == "function" then pcall(M.env.ToolMinerSpawnerUnload) end
+M.started = os.clock()
+
+function M.track(connection, list)
+    local target = list or M.connections
+    target[#target + 1] = connection
+    return connection
+end
+
+function M.disconnect(list)
+    for _, connection in ipairs(list) do pcall(function() connection:Disconnect() end) end
+    table.clear(list)
+end
+
+function M.trace(message)
+    if M.dead then return end
+    local line = string.format("[%6.2fs] %s", os.clock() - M.started, tostring(message))
+    M.logs[#M.logs + 1] = line
+    if #M.logs > 220 then table.remove(M.logs, 1) end
+    print("[ToolMiner] " .. line)
+    if M.modalMode == "log" and M.ui and M.ui.exportBox then
+        pcall(function() M.ui.exportBox.Text = table.concat(M.logs, "\n") end)
+    end
+end
+
+function M.status(message, state)
+    if M.dead or not M.ui or not M.ui.status then return end
+    pcall(function()
+        M.ui.status.Text = message
+        M.ui.status.TextColor3 = state == true and M.colors.good or (state == false and M.colors.bad or M.colors.muted)
+    end)
+end
+
+-- task.spawn directly preserves the executor/script capability context more reliably than
+-- spawning a manually-created coroutine on some Roblox runtimes.
+function M.spawn(callback)
+    if M.dead then return end
+    local thread
+    thread = task.spawn(function()
+        local ok, err = xpcall(callback, debug.traceback)
+        M.workers[coroutine.running()] = nil
+        if not ok and not M.dead then
+            M.trace(err)
+            M.status("An error occurred. Open Log for details.", false)
+        end
+    end)
+    M.workers[thread] = true
+    return thread
+end
+
+function M.resolve(root, path)
+    local node = root
+    for segment in path:gmatch("[^%.]+") do
+        node = node and node:FindFirstChild(segment)
+        if not node then return nil end
+    end
+    return node
+end
+
+M.confidenceRank = {Candidate = 1, Strong = 2, Confirmed = 3}
+M.noisyNames = {
+    ["tool"] = true, ["tools"] = true, ["toolscript"] = true, ["toolgiver"] = true,
+    ["toolgiverclickpart"] = true, ["handle"] = true, ["template"] = true,
+    ["clear tools"] = true, ["cleartools"] = true, ["item"] = true, ["items"] = true,
+    ["button"] = true, ["icon"] = true, ["frame"] = true, ["model"] = true
+}
+
+function M.cleanCandidateName(value)
+    if type(value) ~= "string" then return nil end
+    value = value:gsub("^%s+", ""):gsub("%s+$", "")
+    if value == "" or #value > 120 then return nil end
+    if M.noisyNames[value:lower()] then return nil end
+    if value:match("^rbxassetid://") or value:match("^https?://") then return nil end
+    return value
+end
+
+function M.addPath(entry, path)
+    if type(path) ~= "string" or path == "" then return end
+    entry.observedPaths = entry.observedPaths or {}
+    if #entry.observedPaths < 12 and not table.find(entry.observedPaths, path) then
+        entry.observedPaths[#entry.observedPaths + 1] = path
+    end
+end
+
+function M.addSource(entry, source)
+    if type(source) ~= "string" or source == "" then return end
+    entry.sources = entry.sources or {}
+    if #entry.sources < 12 and not table.find(entry.sources, source) then
+        entry.sources[#entry.sources + 1] = source
+    end
+    entry.source = table.concat(entry.sources, " + ")
+end
+
+function M.discover(name, options)
+    name = M.cleanCandidateName(name)
+    if not name then return nil end
+    options = options or {}
+    local entry = M.observed[name]
+    if not entry then
+        entry = {
+            name = name, displayName = options.displayName or name, category = options.category or "",
+            kind = options.kind or "Deep discovery", icon = M.icon(options.icon), order = options.order or 1000000,
+            source = "", sources = {}, catalog = false, filters = options.filters or "",
+            observedPaths = {}, interactions = {}, observedCount = 0, confidence = options.confidence or "Candidate",
+            route = options.route or "PickingTools", gunSkin = options.gunSkin, routeHint = options.routeHint,
+            evidence = options.evidence
+        }
+        M.observed[name] = entry
+    end
+    entry.observedCount = (entry.observedCount or 0) + 1
+    if options.displayName and (entry.displayName == entry.name or entry.displayName == "") then entry.displayName = options.displayName end
+    if options.icon and (not entry.icon or entry.icon == "") then entry.icon = M.icon(options.icon) end
+    if options.kind and (entry.kind == "Deep discovery" or options.confidence == "Confirmed") then entry.kind = options.kind end
+    if options.route then entry.route = options.route end
+    if options.gunSkin and not entry.gunSkin then entry.gunSkin = options.gunSkin end
+    if options.routeHint and not entry.routeHint then entry.routeHint = options.routeHint end
+    if options.evidence and not entry.evidence then entry.evidence = options.evidence end
+    local currentRank = M.confidenceRank[entry.confidence] or 0
+    local nextRank = M.confidenceRank[options.confidence] or 0
+    if nextRank > currentRank then entry.confidence = options.confidence end
+    M.addSource(entry, options.source or "Deep discovery")
+    M.addPath(entry, options.path)
+    if options.interaction then
+        entry.interactions = entry.interactions or {}
+        if #entry.interactions < 8 and not table.find(entry.interactions, options.interaction) then entry.interactions[#entry.interactions + 1] = options.interaction end
+    end
+    return entry
+end
+
+function M.seedPlaceDiscoveries()
+    for _, name in ipairs({"CreditCardBoy", "CreditCardGirl"}) do
+        M.discover(name, {kind = "Direct PickingTools", source = "Place script direct request", confidence = "Confirmed", route = "PickingTools", evidence = "Player8Handler invokes PickingTools with this button name."})
+    end
+
+    local serialized = {
+        {"Large Pizza Pie Shared) (Full)", "Workspace / pizza tool giver"}, {"JettsTray", "Workspace / Jetts"},
+        {"BananaIceCreamLarge", "Workspace / Jetts"}, {"JettsFruitPunch", "Workspace / Jetts"},
+        {"MangoFuegoSauceBottle", "Workspace / Jetts"}, {"MinionsVoicebox", "Workspace / house tool room"},
+        {"FlagGun", "Workspace / house tool room"}, {"Bananapeel", "Workspace / house tool room"},
+        {"FartGun", "Workspace / house tool room"}, {"Moo Box", "Workspace / house tool room"}
+    }
+    for _, pair in ipairs(serialized) do
+        M.discover(pair[1], {kind = "Serialized Tool", source = "Place.rbxl Tool instance", confidence = "Confirmed", path = pair[2]})
+    end
+
+    -- Strong world-giver names recovered from the supplied place hierarchy. These include
+    -- ToolGivers, FoodTools and explicit ToolGiverClickPart/ToolGiver interactions that may
+    -- never stream to the client during an ordinary scan.
+    local worldGiverSeeds = {
+        "Apple", "Assault", "Axe", "BabyBottle", "BabyHippo", "BabyMonkey", "Banana", "BankGateKeyWhite",
+        "Basketball", "BBQTool", "Bloxaide", "BlueKeycard", "Bomb", "Book", "BottledWater", "Brush",
+        "ChipsGreen", "ChipsRed", "ChocolateBar", "Coke", "FireModel", "FireX", "FishingRod", "GlockBrown",
+        "Hairbrush", "Hammer", "HotDog", "Icecream", "IcecreamBubblegum", "IcecreamCake", "IcecreamChocolate",
+        "IcecreamMint", "IcecreamVanilla", "JettsTray", "Milk", "Minions2026_BananaPeel",
+        "Minions2026_DynamitePlunger", "Minions2026_JamesCamera", "Money", "Newspaper", "Phone", "Pizza",
+        "POIFlyer", "Popcorn", "Present", "ShakeChocolate", "Shotgun", "SignBlack", "SignPink", "SignRed",
+        "SoccerBall", "Summer2026Photostrip", "TakeOutPizza", "Toothbrush", "Trophy", "Vacuum", "Waffle",
+        "Weights", "Wrench"
+    }
+    for _, name in ipairs(worldGiverSeeds) do
+        M.discover(name, {kind = "Place world-giver", source = "Place.rbxl tool-giver hierarchy", confidence = "Strong", routeHint = "World interaction / server validated"})
+    end
+
+    local toolsContainerSeeds = {
+        "Bobcat Chew Toy", "CatWand", "Dynamite", "Jett’s Chew Toy", "Medicaldropper", "MedicalGloves",
+        "MedicalSpray", "Medicine", "Plate", "SmallBall", "TennisBall"
+    }
+    for _, name in ipairs(toolsContainerSeeds) do
+        M.discover(name, {kind = "Place Tools-container entry", source = "Place.rbxl Tools container", confidence = "Strong", routeHint = "World interaction / server validated"})
+    end
+
+    for _, name in ipairs({
+        "JungleNuggets4", "JungleNuggets8", "JungleNuggets12",
+        "BananaIceCreamSmall", "BananaIceCreamMedium", "BananaIceCreamLarge",
+        "JettsFruitPunch", "MangoFuegoSauceBottle"
+    }) do
+        M.discover(name, {kind = "Jetts tool", source = "JettsMenuConstants", confidence = "Strong", routeHint = "SubmitJettsOrder (world/order context required)"})
+    end
+
+    local foods = {"Brownies", "Cake", "Chicken", "Cookies", "Enchiladas", "Lasagne", "Muffins", "Pizza"}
+    for _, food in ipairs(foods) do
+        M.discover("BakeFull_" .. food, {kind = "Baking tool", source = "BakingConfig generated name", confidence = "Confirmed", routeHint = "BakeOven / GrabBaked context required"})
+        M.discover("BakePortion_" .. food, {kind = "Baking tool", source = "BakingConfig generated name", confidence = "Confirmed", routeHint = "BakeOven / GrabBaked context required"})
+    end
+    M.discover("Burnt Food", {kind = "Baking tool", source = "BakingConfig.BURNT_FOOD_TOOL", confidence = "Confirmed", routeHint = "BakeOven / GrabBaked context required"})
+
+    for _, name in ipairs({
+        "JulyFireworkBasic", "JulyFireworkBobcat", "JulyFireworkBrookhaven",
+        "JulyFireworkFloorSparkler", "JulyFireworkGalaxySpiral", "JulyFireworkHeartBurst"
+    }) do
+        M.discover(name, {kind = "Firework tool", source = "FireworkConstants", confidence = "Confirmed", routeHint = "Firework system; paid types use server inventory"})
+    end
+
+    for _, name in ipairs({"Axe", "Hammer", "Wrench"}) do
+        M.discover(name, {kind = "Known tool", source = "MetalDetectorToolsUtil", confidence = "Strong", evidence = "Explicit prohibited-tool name in shared client code."})
+    end
+
+    -- They are merged/deduplicated with ToolsConfig and the place-derived discoveries above.
+    local lightningHubKnown = {
+        "BabyRattle", "Baseball", "Basketball", "Boombox", "Bow", "Box", "Candle", "CandyCane",
+        "Couch", "Crystal", "DSLRCamera", "Donut", "EggLauncher", "FireHose", "Firework", "FireX",
+        "Football", "GhostDetector", "Glider", "GlowingBatons", "GuardTorch", "HorseBrush", "JoustBlue",
+        "JoustRed", "Lipstick", "Megaphone", "PaintRoller", "PaperbagFire", "PropMaker", "ScoreCard",
+        "Slingshot", "Snowball", "SoccerBall", "SprayCan", "Thermos", "WaterBalloon", "WateringCan",
+        "WhackABunnyMallet", "YogaMat"
+    }
+    for _, name in ipairs(lightningHubKnown) do
+        M.discover(name, {kind = "LightningHub known tool", source = "LightningHub V48 full catalog fallback", confidence = "Strong"})
+    end
+end
+
+function M.scanToolFields(root, source, basePath, budget)
+    if type(root) ~= "table" then return 0, 0 end
+    local seen, found, visited = {}, 0, 0
+    local maxNodes = budget or 90000
+    local directKeys = {
+        tool = true, toolname = true, toolid = true, fulltool = true, portiontool = true,
+        rewardtool = true, grantedtool = true, equiptool = true, backpacktool = true
+    }
+    local function safeKeyText(key)
+        local ok, text = pcall(tostring, key)
+        return ok and text or "<key>"
+    end
+    local function rawField(tbl, a, b)
+        if type(tbl) ~= "table" then return nil end
+        local v = rawget(tbl, a)
+        if v == nil and b then v = rawget(tbl, b) end
+        return v
+    end
+    local function walk(node, path, depth)
+        if type(node) ~= "table" or seen[node] or depth > 14 or visited >= maxNodes then return end
+        seen[node] = true
+
+        -- Use next/rawget only. Some loaded libraries expose metatable-backed tables
+        -- (for example sleitnick_signal) whose normal .Name/.Type access throws.
+        -- Deep discovery must never execute arbitrary __index/__pairs behavior.
+        local key, value = next(node)
+        while key ~= nil do
+            visited = visited + 1
+            if visited >= maxNodes then return end
+            local keyText = safeKeyText(key)
+            local keyNorm = keyText:gsub("[^%w]", ""):lower()
+            local childPath = path == "" and keyText or (path .. "/" .. keyText)
+            if type(value) == "string" then
+                local isToolKey = directKeys[keyNorm] or keyNorm:find("toolname", 1, true) or keyNorm:find("toolid", 1, true)
+                if isToolKey then
+                    if M.discover(value, {kind = "Remote/module reference", source = source, confidence = "Strong", path = childPath, evidence = "String stored in a tool-named field."}) then found = found + 1 end
+                end
+            elseif type(value) == "table" then
+                local recordName = rawField(value, "Name", "name")
+                local recordType = rawField(value, "Type", "type") or rawField(value, "Class", "class")
+                if type(recordName) == "string" and type(recordType) == "string" and recordType:lower():find("tool", 1, true) then
+                    if M.discover(recordName, {kind = "Remote/module tool record", source = source, confidence = "Strong", path = childPath, evidence = "Record type contains 'tool'."}) then found = found + 1 end
+                end
+                walk(value, childPath, depth + 1)
+            end
+            if visited % 700 == 0 then task.wait() end
+            key, value = next(node, key)
+        end
+    end
+    walk(root, basePath or "", 0)
+    return found, visited
+end
+
+function M.mineStaticModules()
+    local specs = {
+        {path = "Modules.Shared.Housing.Baking.BakingConfig", label = "BakingConfig"},
+        {path = "Modules.Shared.Fireworks.FireworkConstants", label = "FireworkConstants"},
+        {path = "Modules.Shared.Game.JettsMenuConstants", label = "JettsMenuConstants"},
+        {path = "Modules.Shared.Tools.MetalDetectorToolsUtil", label = "MetalDetectorToolsUtil"}
+    }
+    local total = 0
+    for _, spec in ipairs(specs) do
+        local module = M.resolve(M.RS, spec.path)
+        if module and module:IsA("ModuleScript") then
+            local ok, result = pcall(require, module)
+            if ok and type(result) == "table" then
+                local found = M.scanToolFields(result, "Loaded " .. spec.label, spec.path, 12000)
+                total = total + (found or 0)
+                if spec.label == "BakingConfig" and type(result.Foods) == "table" then
+                    for food in pairs(result.Foods) do
+                        M.discover("BakeFull_" .. tostring(food), {kind = "Baking tool", source = "Live BakingConfig", confidence = "Confirmed", routeHint = "BakeOven / GrabBaked context required"})
+                        M.discover("BakePortion_" .. tostring(food), {kind = "Baking tool", source = "Live BakingConfig", confidence = "Confirmed", routeHint = "BakeOven / GrabBaked context required"})
+                    end
+                    if type(result.BURNT_FOOD_TOOL) == "string" then M.discover(result.BURNT_FOOD_TOOL, {kind = "Baking tool", source = "Live BakingConfig", confidence = "Confirmed"}) end
+                elseif spec.label == "FireworkConstants" then
+                    local map = result.TOOL_NAME_BY_TYPE
+                    if type(map) == "table" then for _, name in pairs(map) do M.discover(name, {kind = "Firework tool", source = "Live FireworkConstants", confidence = "Confirmed"}) end end
+                    if type(result.ALL_TYPE_NAMES) == "table" then
+                        for _, typ in ipairs(result.ALL_TYPE_NAMES) do
+                            M.discover("JulyFirework" .. tostring(typ), {kind = "Firework tool", source = "Live FireworkConstants", confidence = "Strong"})
+                        end
+                    end
+                elseif spec.label == "JettsMenuConstants" and type(result.JETTS_MENU_ITEMS_ALL) == "table" then
+                    for name, data in pairs(result.JETTS_MENU_ITEMS_ALL) do
+                        local toolName = type(data) == "table" and data.toolName or name
+                        M.discover(toolName, {kind = "Jetts tool", source = "Live JettsMenuConstants", confidence = "Confirmed", routeHint = "SubmitJettsOrder (world/order context required)", icon = type(data) == "table" and data.image or nil})
+                    end
+                elseif spec.label == "MetalDetectorToolsUtil" and type(result.ADDITIONAL_PROHIBITED_TOOLS) == "table" then
+                    for _, name in ipairs(result.ADDITIONAL_PROHIBITED_TOOLS) do M.discover(name, {kind = "Known tool", source = "Live MetalDetectorToolsUtil", confidence = "Strong"}) end
+                end
+            else
+                M.trace(spec.label .. " require skipped: " .. tostring(result))
+            end
+        end
+    end
+
+    return total
+end
+
+function M.mineLoadedModules()
+    local getter = getloadedmodules or M.env.getloadedmodules
+    if type(getter) ~= "function" then return 0 end
+    local ok, modules = pcall(getter)
+    if not ok or type(modules) ~= "table" then return 0 end
+    local found, checked, skipped = 0, 0, 0
+    for _, module in ipairs(modules) do
+        local readable, isModule, moduleName, modulePath = pcall(function()
+            return module and module:IsA("ModuleScript"), module and module.Name or "", module and module:GetFullName() or ""
+        end)
+        if readable and isModule then
+            local lower = tostring(moduleName):lower()
+            if lower:find("tool", 1, true) or lower:find("baking", 1, true) or lower:find("firework", 1, true) or lower:find("jett", 1, true) then
+                checked += 1
+                local success, result = pcall(require, module)
+                if success and type(result) == "table" then
+                    local n = M.scanToolFields(result, "Loaded module " .. tostring(moduleName), tostring(modulePath), 5000)
+                    found += (n or 0)
+                else
+                    skipped += 1
+                end
+            end
+        elseif not readable then
+            skipped += 1
+        end
+        if checked >= 120 then break end
+    end
+    M.trace(string.format("Loaded-module mining checked %d likely modules, added %d field hits, skipped %d protected/unreadable modules.", checked, found, skipped))
+    return found
+end
+
+function M.inferGiverCandidate(object)
+    if not object then return nil, nil end
+    local current = object
+    local hops = 0
+    while current and current ~= game and hops < 8 do
+        local lower = current.Name:lower()
+        if lower == "toolgiverclickpart" or lower == "toolgiver" then
+            local parent = current.Parent
+            if parent then return M.cleanCandidateName(parent.Name), parent:GetFullName() end
+        end
+        local parent = current.Parent
+        if parent then
+            local plower = parent.Name:lower()
+            if plower == "toolgivers" or plower == "foodtools" then return M.cleanCandidateName(current.Name), current:GetFullName() end
+            if plower == "tools" then
+                local grand = parent.Parent
+                if current:IsA("Model") then return M.cleanCandidateName(current.Name), current:GetFullName() end
+                if grand and grand.Name and not M.noisyNames[grand.Name:lower()] then return M.cleanCandidateName(grand.Name), grand:GetFullName() end
+            end
+        end
+        current, hops = parent, hops + 1
+    end
+    return nil, nil
+end
+
+function M.inspectDiscoveryObject(object)
+    if not object then return 0 end
+    local added = 0
+    if object:IsA("Tool") then
+        M.observe(object, "Observed live")
+        return 1
+    end
+
+    if object:IsA("StringValue") then
+        local lower = object.Name:gsub("[^%w]", ""):lower()
+        if lower == "toolname" or lower == "toolid" or lower == "currenttool" then
+            if M.discover(object.Value, {kind = "StringValue tool reference", source = "Live object metadata", confidence = "Strong", path = object:GetFullName()}) then added = added + 1 end
+        end
+    end
+
+    if object:IsA("ClickDetector") or object:IsA("ProximityPrompt") then
+        local name, path = M.inferGiverCandidate(object)
+        if name and M.discover(name, {kind = "World tool giver", source = object.ClassName, confidence = "Strong", path = path, routeHint = "World interaction / server validated", interaction = object}) then added = added + 1 end
+    end
+
+    if object:IsA("GuiButton") then
+        local path = object:GetFullName()
+        local lowerPath = path:lower()
+        local hasToolMarker = object:FindFirstChild("GreenCheckMark") ~= nil
+        local specialMenu = lowerPath:find("bankcards", 1, true) or lowerPath:find("jettsordermenu", 1, true)
+        if hasToolMarker or specialMenu then
+            local name = M.cleanCandidateName(object.Name)
+            local lowerName = name and name:lower() or ""
+            local ignored = lowerName == "back" or lowerName == "close" or lowerName == "search" or lowerName == "buy" or lowerName == "clear"
+            if name and not ignored and not lowerName:find("category", 1, true) then
+                if M.discover(name, {kind = "Native tool UI", source = "Live tool-related UI", confidence = "Strong", path = path, route = "PickingTools"}) then added = added + 1 end
+            end
+        end
+    end
+
+    local lname = object.Name:lower()
+    if lname:find("tool", 1, true) or lname:find("gun", 1, true) or lname:find("firework", 1, true) or lname:find("bake", 1, true) or lname:find("jett", 1, true) then
+        local ok, attrs = pcall(object.GetAttributes, object)
+        if ok and type(attrs) == "table" then
+            for key, value in pairs(attrs) do
+                local kn = tostring(key):gsub("[^%w]", ""):lower()
+                if type(value) == "string" and (kn == "tool" or kn == "toolname" or kn == "toolid" or kn:find("toolname", 1, true)) then
+                    if M.discover(value, {kind = "Attribute tool reference", source = "Live attributes", confidence = "Strong", path = object:GetFullName() .. " [" .. tostring(key) .. "]"}) then added = added + 1 end
+                end
+            end
+        end
+    end
+    return added
+end
+
+-- For read-only discovery calls only. A timed-out inventory call is never retried.
+function M.readWithTimeout(label, seconds, callback)
+    local result
+    local worker = M.spawn(function() result = table.pack(pcall(callback)) end)
+    local started = os.clock()
+    while not result and not M.dead and os.clock() - started < seconds do task.wait(0.05) end
+    if not result then
+        if worker then pcall(task.cancel, worker); M.workers[worker] = nil end
+        M.trace(label .. ": timed out")
+        return false, "Timed out"
+    end
+    if not result[1] then M.trace(label .. ": " .. tostring(result[2])) end
+    return table.unpack(result, 1, result.n)
+end
+
+function M.inventory()
+    local owned, holdable = {}, {}
+    local roots = {M.Player:FindFirstChildOfClass("Backpack"), M.Player.Character, M.Player:FindFirstChild("StarterGear")}
+    for index = 1, 3 do
+        local root = roots[index]
+        if root then
+            for _, tool in ipairs(root:GetChildren()) do
+                if tool:IsA("Tool") then
+                    owned[tool.Name] = tool
+                    if index < 3 then holdable[tool.Name] = tool end
+                    local gun = tool:FindFirstChild("GunName")
+                    if gun and gun:IsA("StringValue") and gun.Value ~= "" then
+                        owned[gun.Value] = tool
+                        if index < 3 then holdable[gun.Value] = tool end
+                    end
+                end
+            end
+        end
+    end
+    return owned, holdable
+end
+
+function M.hold(name)
+    local _, available = M.inventory()
+    local tool = available[name]
+    local character = M.Player.Character
+    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+    if not tool or not humanoid or humanoid.Health <= 0 then
+        M.status("No usable copy of " .. name .. " is in your backpack yet.", false)
+        return false
+    end
+    if tool.Parent ~= character then humanoid:EquipTool(tool) end
+    M.status("Holding " .. name, true)
+    return true
+end
+
+-- Brookhaven's stock client-to-client tool flow recovered from the supplied place:
+-- sender:    PlayerTrigEvent:FireServer("ToolGiveToServer", recipientPlayer, toolName)
+-- recipient: PlayerTrigEvent:FireServer("AcceptedToolToServer", toolName, senderPlayer)
+-- The handoff probe below deliberately exercises only the recipient half, using a real
+-- other Player as the donor identity. This lets us test the same route used by menus
+-- that emulate an incoming player gift without relying on PickingTools.
+function M.playerTrigRemote()
+    local re = M.RS:FindFirstChild("RE")
+    local remote = re and re:FindFirstChild("1Playe1rTrigge1rEven1t")
+    if remote and remote:IsA("RemoteEvent") then return remote end
+    return nil
+end
+
+function M.otherPlayers()
+    local list = {}
+    for _, player in ipairs(M.Players:GetPlayers()) do
+        if player ~= M.Player then list[#list + 1] = player end
+    end
+    table.sort(list, function(a, b) return a.Name:lower() < b.Name:lower() end)
+    return list
+end
+
+function M.resolveDonor()
+    local list = M.otherPlayers()
+    if #list == 0 then
+        M.handoffDonorName = nil
+        return nil
+    end
+    if M.handoffDonorName then
+        for _, player in ipairs(list) do
+            if player.Name == M.handoffDonorName then return player end
+        end
+    end
+    M.handoffDonorName = list[1].Name
+    return list[1]
+end
+
+function M.refreshDonorButton()
+    if not M.ui or not M.ui.donor then return end
+    local donor = M.resolveDonor()
+    if donor then
+        M.ui.donor.Text = "Donor: " .. donor.DisplayName .. "  @" .. donor.Name .. "   [cycle]"
+        M.ui.donor.TextColor3 = M.colors.text
+    else
+        M.ui.donor.Text = "Donor: no other player in server"
+        M.ui.donor.TextColor3 = M.colors.bad
+    end
+end
+
+function M.cycleDonor(step)
+    local list = M.otherPlayers()
+    if #list == 0 then
+        M.handoffDonorName = nil
+        M.refreshDonorButton()
+        M.status("Player handoff needs another player in the server.", false)
+        return nil
+    end
+    local index = 0
+    for i, player in ipairs(list) do
+        if player.Name == M.handoffDonorName then index = i break end
+    end
+    index = index + (step or 1)
+    if index > #list then index = 1 elseif index < 1 then index = #list end
+    M.handoffDonorName = list[index].Name
+    M.refreshDonorButton()
+    M.details()
+    M.status("Handoff donor set to " .. list[index].Name, true)
+    return list[index]
+end
+
+function M.handoff(entry, intent)
+    if M.dead or not entry or entry.isCategory then return false end
+    if entry.kind == "Gun skin" then
+        M.status("Gun-skin rows use GunEquip, not the player handoff Tool route.", false)
+        return false
+    end
+    if M.busy then
+        M.status("Waiting for the current request to finish.")
+        return false
+    end
+    local remote = M.playerTrigRemote()
+    if not remote then
+        entry.lastResult = "HANDOFF REMOTE MISSING"
+        M.status('RE["1Playe1rTrigge1rEven1t"] was not found.', false)
+        M.render(false)
+        return false
+    end
+    local donor = M.resolveDonor()
+    if not donor then
+        entry.lastResult = "NO DONOR"
+        M.status("Join with Client2 / another player, then use Handoff receive.", false)
+        M.render(false)
+        return false
+    end
+
+    local before = {}
+    local ownedBefore = M.inventory()
+    for name, tool in pairs(ownedBefore) do before[tool] = name end
+
+    local operation = {name = entry.name, intent = intent or "get", started = os.clock(), route = "PlayerHandoff"}
+    M.busy = operation
+    M.nextRequest = os.clock() + 0.35
+    entry.lastResult = "HANDOFF..."
+    M.trace("Handoff accept: item=" .. entry.name .. " donor=" .. donor.Name .. " via AcceptedToolToServer")
+    M.status("Accepting " .. entry.name .. " as if offered by " .. donor.Name .. "...")
+    M.render(false)
+
+    M.spawn(function()
+        local ok, err = pcall(function()
+            remote:FireServer("AcceptedToolToServer", entry.name, donor)
+        end)
+        if not ok then
+            if M.busy == operation then M.busy = nil end
+            entry.lastResult = "HANDOFF ERROR"
+            M.trace("Handoff error " .. entry.name .. ": " .. tostring(err))
+            M.status("Handoff call failed: " .. tostring(err):sub(1, 160), false)
+            M.render(false)
+            return
+        end
+
+        local deadline = os.clock() + 3.25
+        local exact, newTool, newName
+        repeat
+            local owned = M.inventory()
+            exact = owned[entry.name]
+            if exact then break end
+            for name, tool in pairs(owned) do
+                if not before[tool] then newTool, newName = tool, name break end
+            end
+            if newTool then break end
+            task.wait(0.08)
+        until M.dead or os.clock() >= deadline
+        if M.dead then return end
+        if M.busy == operation then M.busy = nil end
+        M.nextRequest = os.clock() + 0.15
+
+        if exact then
+            entry.lastResult = "HANDOFF SPAWNED"
+            M.status("Handoff received " .. entry.name .. " from donor route.", true)
+            if intent == "hold" then M.hold(entry.name) end
+        elseif newTool then
+            entry.lastResult = "HANDOFF -> " .. tostring(newName)
+            M.status("Handoff created a Tool named " .. tostring(newName) .. " (requested " .. entry.name .. ").", true)
+            M.trace("Handoff alias: requested=" .. entry.name .. " observed=" .. tostring(newName))
+            if intent == "hold" then M.hold(newName) end
+        else
+            entry.lastResult = "HANDOFF SENT"
+            M.status("AcceptedToolToServer was sent, but no new Tool was observed. Try another donor/item and check Log.", false)
+        end
+        M.render(false)
+    end)
+    return true
+end
+
+function M.useWorldInteraction(entry, intent)
+    local interaction
+    for _, candidate in ipairs(entry.interactions or {}) do
+        if candidate and candidate.Parent then interaction = candidate break end
+    end
+    if not interaction then
+        M.status("The native giver is no longer loaded. Deep scan again near the giver.", false)
+        return false
+    end
+    local ok, err
+    if interaction:IsA("ClickDetector") then
+        local fire = fireclickdetector or M.env.fireclickdetector
+        if type(fire) ~= "function" then M.status("ClickDetector found, but this runtime cannot fire it.", false); return false end
+        ok, err = pcall(fire, interaction)
+    elseif interaction:IsA("ProximityPrompt") then
+        local fire = fireproximityprompt or M.env.fireproximityprompt
+        if type(fire) ~= "function" then M.status("ProximityPrompt found, but this runtime cannot fire it.", false); return false end
+        ok, err = pcall(fire, interaction)
+    else
+        M.status("Unsupported world interaction: " .. interaction.ClassName, false)
+        return false
+    end
+    if not ok then M.status("World interaction failed: " .. tostring(err):sub(1, 160), false); return false end
+    M.status("Triggered native giver for " .. entry.name .. ". Waiting for inventory...")
+    M.spawn(function()
+        local deadline = os.clock() + 3
+        local found
+        repeat
+            task.wait(0.12)
+            found = M.inventory()[entry.name]
+        until found or M.dead or os.clock() >= deadline
+        if M.dead then return end
+        if found then
+            entry.lastResult = "SPAWNED"
+            if intent == "hold" then M.hold(entry.name) else M.status("Received " .. entry.name .. " from world interaction.", true) end
+        else
+            entry.lastResult = "GIVER SENT"
+            M.status("Giver triggered, but no matching Tool reached your inventory. The server may require proximity/state or use a different final tool name.", false)
+        end
+        M.render(false)
+    end)
+    return true
+end
+
+function M.act(entry, intent)
+    if M.dead or not entry then return end
+    local owned = M.inventory()
+    local decision = M.actionDecision(entry, intent, owned[entry.name] ~= nil, M.busy ~= nil)
+    if decision == "category" then
+        M.category, M.filter, M.page = entry.name, "All tools", 1
+        M.render(true)
+        return
+    elseif decision == "hold" then M.hold(entry.name); return
+    elseif decision == "owned" then M.status("Already in your inventory: " .. entry.name, true); return
+    elseif decision == "absent" then M.status("This tool is not in your inventory."); return
+    elseif decision == "busy" then M.status("Waiting for the current item request to finish."); return
+    elseif decision == "interaction" then M.useWorldInteraction(entry, intent); return
+    elseif decision == "unavailable" then
+        M.status("No usable native request path was found for " .. entry.name, false)
+        return
+    end
+
+    if os.clock() < M.nextRequest then M.status("Give the last request a moment to settle."); return end
+    local path, args = M.requestArgs(entry)
+    local remote = path and M.resolve(M.RS, path)
+    if not remote or not remote:IsA("RemoteFunction") then
+        if entry.interactions and #entry.interactions > 0 and (intent == "get" or intent == "hold") then
+            M.useWorldInteraction(entry, intent)
+            return
+        end
+        M.status("Native request path is unavailable: " .. tostring(path), false)
+        entry.lastResult = "ROUTE MISSING"
+        M.render(false)
+        return
+    end
+
+    local operation = {name = entry.name, intent = intent, started = os.clock()}
+    M.busy = operation
+    M.nextRequest = os.clock() + 0.45
+    M.status((intent == "remove" and "Removing " or "Requesting ") .. entry.name .. "...")
+    M.trace("Request " .. intent .. ": " .. entry.name .. " via " .. path)
+    M.details()
+
+    M.spawn(function()
+        local ok, response = pcall(function() return remote:InvokeServer(table.unpack(args)) end)
+        if M.dead then return end
+        M.trace("Response " .. entry.name .. ": " .. (ok and tostring(response) or ("error: " .. tostring(response))))
+
+        local deadline = os.clock() + 2.2
+        local found = M.inventory()[entry.name]
+        while os.clock() < deadline and not M.dead do
+            found = M.inventory()[entry.name]
+            if (intent == "remove" and not found) or (intent ~= "remove" and found) then break end
+            if not ok then break end
+            task.wait(0.08)
+        end
+        if M.dead then return end
+        M.busy = nil
+        M.nextRequest = os.clock() + 0.18
+
+        if intent == "remove" and not found then
+            entry.lastResult = "REMOVED"
+            M.status("Tool is no longer in your inventory: " .. entry.name, true)
+        elseif intent ~= "remove" and found then
+            entry.lastResult = "SPAWNED"
+            if intent == "hold" then M.hold(entry.name) else M.status("Received " .. entry.name, true) end
+        elseif not ok then
+            entry.lastResult = "ERROR"
+            -- If a real native world giver/prompt is loaded, try that as the second route.
+            if entry.interactions and #entry.interactions > 0 and (intent == "get" or intent == "hold") then
+                M.status("Direct request errored; trying loaded native giver for " .. entry.name .. "...")
+                M.render(false)
+                task.wait(0.05)
+                M.useWorldInteraction(entry, intent)
+                return
+            end
+            M.status("Request failed: " .. tostring(response):sub(1, 160), false)
+        elseif response == false then
+            entry.lastResult = "REJECTED"
+            if entry.interactions and #entry.interactions > 0 and (intent == "get" or intent == "hold") then
+                M.status("PickingTools rejected; trying loaded native giver for " .. entry.name .. "...")
+                M.render(false)
+                task.wait(0.05)
+                M.useWorldInteraction(entry, intent)
+                return
+            end
+            M.status(entry.name .. " was rejected/locked by the server.", false)
+        elseif intent ~= "remove" then
+            if response ~= true and entry.interactions and #entry.interactions > 0 then
+                entry.lastResult = "TRYING GIVER"
+                M.status("Direct request returned no tool; trying loaded native giver for " .. entry.name .. "...")
+                M.render(false)
+                task.wait(0.05)
+                M.useWorldInteraction(entry, intent)
+                return
+            end
+            entry.lastResult = response == true and "ACCEPTED" or "SENT"
+            M.status("Request sent for " .. entry.name .. "; exact Tool object was not observed yet.", response == true and true or nil)
+        else
+            entry.lastResult = "UNCHANGED"
+            M.status("Tool is still present. Server response: " .. tostring(response), false)
+        end
+        M.render(false)
+    end)
+end
+
+function M.merge()
+    local previous = M.byName or {}
+    local merged = {}
+    local function cloneEntry(entry)
+        local copy = {}
+        for key, value in pairs(entry) do
+            if type(value) == "table" and (key == "observedPaths" or key == "sources" or key == "interactions") then
+                local t = {}
+                for i, item in ipairs(value) do t[i] = item end
+                copy[key] = t
+            else copy[key] = value end
+        end
+        return copy
+    end
+
+    -- Native config wins for display/category/gun metadata.
+    for name, entry in pairs(M.catalog) do
+        local copy = cloneEntry(entry)
+        if previous[name] then copy.lastResult = previous[name].lastResult end
+        copy.sources = {entry.source}
+        copy.route = copy.route or (not copy.isCategory and "PickingTools" or nil)
+        merged[name] = copy
+    end
+
+    -- Add every other mined name. Every non-category name is actionable: ordinary extras
+    -- default to PickingTools and can additionally carry native giver interactions.
+    for name, observation in pairs(M.observed) do
+        if merged[name] then
+            local target = merged[name]
+            for _, path in ipairs(observation.observedPaths or {}) do M.addPath(target, path) end
+            for _, source in ipairs(observation.sources or {}) do M.addSource(target, source) end
+            if observation.interactions then
+                target.interactions = target.interactions or {}
+                for _, interaction in ipairs(observation.interactions) do
+                    if #target.interactions < 8 and not table.find(target.interactions, interaction) then target.interactions[#target.interactions + 1] = interaction end
+                end
+            end
+            if observation.evidence and not target.evidence then target.evidence = observation.evidence end
+        else
+            local copy = cloneEntry(observation)
+            if previous[name] then copy.lastResult = previous[name].lastResult end
+            copy.route = copy.route or "PickingTools"
+            copy.kind = copy.kind or "Extra mined tool"
+            copy.category = copy.category or ""
+            merged[name] = copy
+        end
+    end
+
+    M.entries = {}
+    for _, entry in pairs(merged) do
+        entry.categoryPath = M.categoryPath(entry, M.categories)
+        M.entries[#M.entries + 1] = entry
+    end
+    table.sort(M.entries, function(a, b)
+        -- Normalize optional booleans before comparing. nil and false must be treated
+        -- identically or table.sort can receive a non-transitive comparator.
+        local aCategory = a.isCategory == true
+        local bCategory = b.isCategory == true
+        if aCategory ~= bCategory then return not aCategory end
+
+        local aCatalog = a.catalog == true
+        local bCatalog = b.catalog == true
+        if aCatalog ~= bCatalog then return aCatalog end
+
+        local aOrder = tonumber(a.order) or 0
+        local bOrder = tonumber(b.order) or 0
+        if aOrder ~= bOrder then return aOrder < bOrder end
+
+        local aName = tostring(a.name or ""):lower()
+        local bName = tostring(b.name or ""):lower()
+        if aName ~= bName then return aName < bName end
+
+        -- Equal sort keys are equal; never claim both directions are ordered.
+        return false
+    end)
+    M.byName = merged
+    local okRender, renderErr = pcall(M.render, false)
+    if not okRender then M.trace("Render skipped: " .. tostring(renderErr)) end
+end
+
+function M.observe(tool, source)
+    if not tool:IsA("Tool") or tool.Name == "" then return end
+    local entry = M.discover(tool.Name, {displayName = tool.Name, kind = "Observed Tool", icon = tool.TextureId,
+        source = source or "Observed live", confidence = "Confirmed", path = tool:GetFullName()})
+    if entry then
+        local gun = tool:FindFirstChild("GunName")
+        if gun and gun:IsA("StringValue") and gun.Value ~= "" then
+            M.discover(gun.Value, {displayName = gun.Value, kind = "Observed gun skin", source = source or "Observed live",
+                confidence = "Confirmed", path = tool:GetFullName() .. ".GunName", routeHint = "Gun skin currently represented by this Tool instance"})
+        end
+    end
+end
+
+function M.scanWorld()
+    if M.scanning or M.dead then return end
+    M.scanning = true
+    M.ui.scan.Text = "Deep scanning..."
+    M.status("Deep-scanning replicated services, tool-givers, UI metadata, tags, and loaded tool modules...")
+    M.spawn(function()
+        local ok, err = pcall(function()
+            local checked, found = 0, 0
+            local roots = {M.RS, workspace, M.Players, game:GetService("StarterPack"), game:GetService("StarterGui"), M.PlayerGui}
+            local seenRoots = {}
+            for _, root in ipairs(roots) do
+                if root and not seenRoots[root] then
+                    seenRoots[root] = true
+                    found = found + M.inspectDiscoveryObject(root)
+                    for _, object in ipairs(root:GetDescendants()) do
+                        if M.dead then return end
+                        checked = checked + 1
+                        found = found + M.inspectDiscoveryObject(object)
+                        if checked % 350 == 0 then task.wait() end
+                    end
+                end
+            end
+
+            local tagsOk, tags = pcall(function() return M.Tags:GetAllTags() end)
+            if tagsOk and type(tags) == "table" then
+                for _, tag in ipairs(tags) do
+                    local lower = tostring(tag):lower()
+                    if lower:find("tool", 1, true) or lower:find("gun", 1, true) or lower:find("weapon", 1, true) or lower:find("firework", 1, true) then
+                        for _, object in ipairs(M.Tags:GetTagged(tag)) do
+                            if object:IsA("Tool") then M.observe(object, "Tag: " .. tag); found = found + 1
+                            else
+                                local ancestor = object:FindFirstAncestorOfClass("Tool")
+                                if ancestor then M.observe(ancestor, "Tag: " .. tag); found = found + 1 end
+                            end
+                        end
+                    end
+                end
+            end
+
+            found = found + (M.mineStaticModules() or 0)
+            found = found + (M.mineLoadedModules() or 0)
+            M.deepStats.lastChecked, M.deepStats.lastHits = checked, found
+            M.trace(string.format("Deep scan checked %d replicated objects and produced %d discovery hits. Streaming still limits world-only content.", checked, found))
+        end)
+        if M.dead then return end
+        M.scanning = false
+        M.ui.scan.Text = "Deep scan"
+        if not ok then M.trace("Deep scan: " .. tostring(err)) end
+        M.merge()
+        if not M.mining and not M.busy then M.status("Deep scan finished. All newly mined names were added to the actionable spawn union.", ok) end
+    end)
+end
+
+function M.nativeFallback()
+    local result, seenRoots = {}, {}
+    local ignore = {Template=true, ClearTools=true, BackButton=true, Delete=true, GreenCheckMark=true, Search=true, Close=true}
+    local function addButton(button, source)
+        if not button:IsA("GuiButton") or ignore[button.Name] then return end
+        local name = M.cleanCandidateName(button.Name)
+        if not name then return end
+        local path = button:GetFullName()
+        local looksTool = button:FindFirstChild("GreenCheckMark") ~= nil or path:lower():find("tool", 1, true)
+            or path:lower():find("bankcards", 1, true) or path:lower():find("jetts", 1, true)
+        if not looksTool then return end
+        local icon = button:FindFirstChild("Icon")
+        local image = icon and (icon:IsA("ImageLabel") or icon:IsA("ImageButton")) and icon.Image or ""
+        result[name] = result[name] or {name=name, displayName=name, category="", icon=image, order=button.LayoutOrder,
+            kind="Native UI tool", source=source, sources={source}, catalog=false, filters="", observedPaths={path}, route="PickingTools"}
+    end
+    local function scanRoot(root, source)
+        if not root or seenRoots[root] then return end
+        seenRoots[root] = true
+        for _, obj in ipairs(root:GetDescendants()) do
+            if obj:IsA("GuiButton") then addButton(obj, source) end
+        end
+    end
+
+    for _, root in ipairs(M.Tags:GetTagged("ToolsMenu")) do scanRoot(root, "Tagged native ToolsMenu") end
+    for _, root in ipairs(M.Tags:GetTagged("LoadableToolEntriesFilter")) do scanRoot(root, "Tagged loadable tool menu") end
+    local starterGui = game:GetService("StarterGui")
+    for _, root in ipairs({M.PlayerGui, starterGui}) do
+        if root then
+            for _, obj in ipairs(root:GetDescendants()) do
+                if obj.Name == "ToolsMenu" or obj.Name == "MainToolMenuFilter" then scanRoot(obj, "Native tool UI") end
+            end
+        end
+    end
+    return result
+end
+
+function M.getCatalogFast(generation)
+    local module = M.resolve(M.RS, "Modules.Shared.DB.Tools.ToolsConfig")
+    local db
+    if module and module:IsA("ModuleScript") then
+        local ok, result = pcall(require, module)
+        if ok and type(result) == "table" then
+            db = result
+            if type(db.cache) == "table" then return db.cache, "ToolsConfig.cache", nil end
+        end
+    end
+
+    -- Direct public RemoteConfig is fast in this place and also gives us the full package
+    -- tree for extra tool-name mining. Do it before waiting on GetConfig.
+    local remote = M.RS:FindFirstChild("GameSdkRemoteConfigFunction")
+    if remote and remote:IsA("RemoteFunction") then
+        local success, packages, defaultPackage = M.readWithTimeout("RemoteConfig", 15, function() return remote:InvokeServer() end)
+        if success and type(packages) == "table" then
+            M.remoteTree = packages
+            local config, packageName = M.findConfig(packages, defaultPackage)
+            if type(config) == "table" then return config, "RemoteConfig / " .. tostring(packageName), packages end
+        end
+    end
+    if M.dead or M.generation ~= generation then return nil, nil, nil, "cancelled" end
+
+    -- Kick the game's own loader, then wait a short bounded period for cache.
+    if module and db then
+        pcall(function()
+            local controllerModule = M.resolve(M.RS, "Modules.Client.Databases.DatabaseRemoteConfigController")
+            if controllerModule and controllerModule:IsA("ModuleScript") then
+                local controller = require(controllerModule)
+                if type(controller) == "table" and type(controller.LoadDatabase) == "function" then controller.LoadDatabase(module) end
+            end
+        end)
+        local deadline = os.clock() + 12
+        while os.clock() < deadline and not M.dead and M.generation == generation do
+            if type(db.cache) == "table" then return db.cache, "ToolsConfig.cache (after native load)", M.remoteTree end
+            task.wait(0.12)
+        end
+        if type(db.GetConfig) == "function" then
+            local success, config = M.readWithTimeout("ToolsConfig.GetConfig", 8, function() return db.GetConfig() end)
+            if success and type(config) == "table" then return config, "ToolsConfig.GetConfig()", M.remoteTree end
+        end
+    end
+    return nil, nil, M.remoteTree, "complete ToolsConfig unavailable"
+end
+
+function M.mine()
+    if M.mining or M.dead then return end
+    M.mining = true
+    M.generation += 1
+    local generation = M.generation
+    M.ui.refresh.Text = "Mining..."
+    M.status("Building the full spawn union...")
+    M.spawn(function()
+        local ok, errorMessage = xpcall(function()
+            -- Start with place/menu-derived names immediately; they remain deduplicated.
+            M.observed = {}
+            M.seedPlaceDiscoveries()
+
+            local config, source, packages, configError = M.getCatalogFast(generation)
+            if M.dead or M.generation ~= generation then return end
+            if config then
+                local entries, categories, stats = M.parseConfig(config, source)
+                M.catalog, M.categories, M.rawConfig, M.stats = entries, categories, config, stats
+                M.source = source
+                M.trace(string.format("ToolsConfig: %d tools / %d categories / %d raw rows", stats.tools, stats.categories, stats.rows))
+            else
+                M.catalog, M.categories, M.rawConfig = {}, {}, nil
+                M.source = "Extra discovery union only"
+                M.trace("ToolsConfig unavailable: " .. tostring(configError))
+            end
+
+            if type(packages) == "table" then
+                local deepHits, visited = M.scanToolFields(packages, "RemoteConfig full tree", "", 160000)
+                M.trace(string.format("Remote-tree tool-field scan: %d hits across %d nodes", deepHits or 0, visited or 0))
+            end
+
+            M.mineStaticModules()
+            M.mineLoadedModules()
+
+            -- Merge every currently rendered native UI tool too.
+            local uiRows, uiCount = M.nativeFallback(), 0
+            for name, entry in pairs(uiRows) do
+                uiCount += 1
+                M.discover(name, {displayName=entry.displayName, kind=entry.kind, icon=entry.icon, source=entry.source,
+                    confidence="Strong", route="PickingTools", path=entry.observedPaths and entry.observedPaths[1]})
+            end
+            M.trace("Native UI extra rows observed: " .. tostring(uiCount))
+
+            M.merge()
+            local nativeCount, extraCount = 0, 0
+            for _, entry in ipairs(M.entries) do
+                if not entry.isCategory then
+                    if entry.catalog then nativeCount += 1 else extraCount += 1 end
+                end
+            end
+            M.coverage = string.format("Spawn union: %d native + %d extra = %d tools", nativeCount, extraCount, nativeCount + extraCount)
+            M.status(string.format("Loaded %d actionable tool names. Deep scan can add streamed/tool-giver names.", nativeCount + extraCount), true)
+        end, debug.traceback)
+
+        if M.dead then return end
+        M.mining = false
+        if not ok then
+            M.trace("Mining stage error: " .. tostring(errorMessage))
+            M.status("Mining stage hit a protected object/module; continuing with the catalog already recovered.", false)
+        end
+        if M.ui and M.ui.refresh then pcall(function() M.ui.refresh.Text = "Re-mine all" end) end
+        M.scanWorld()
+    end)
+end
+
+function M.export(mode)
+    if mode == "log" then return table.concat(M.logs, "\n") end
+    local entries = M.entries
+    if mode == "names" then
+        local lines = {}
+        for _, e in ipairs(entries) do if not e.isCategory then lines[#lines + 1] = e.name end end
+        return table.concat(lines, "\n")
+    end
+    if mode == "json" then
+        local items = {}
+        for _, e in ipairs(entries) do
+            items[#items + 1] = {name=e.name, displayName=e.displayName, kind=e.kind, category=e.category,
+                categoryPath=e.categoryPath, source=e.source, route=e.route, gunSkin=e.gunSkin, item=e.item,
+                filters=e.filters, requirement=e.requirement, hiddenUnlessUnlocked=e.hiddenUnlessUnlocked,
+                sources=e.sources, evidence=e.evidence, observedPaths=e.observedPaths, lastResult=e.lastResult, raw=e.raw}
+        end
+        local ok, json = pcall(function()
+            return M.Http:JSONEncode({minerVersion=M.version, placeId=game.PlaceId, source=M.source, coverage=M.coverage,
+                exportedAtUtc=os.date("!%Y-%m-%dT%H:%M:%SZ"), entries=items})
+        end)
+        return ok and json or ("JSON export failed: " .. tostring(json))
+    end
+    local lines = {"Tool Miner " .. M.version, "Source: " .. M.source, "Coverage: " .. M.coverage,
+        "Every non-category row has an actionable native request route; server unlock checks still apply.", "",
+        "Name\tKind\tCategory\tDisplay name\tRoute\tLast result\tSource\tItem / requirement"}
+    local function clean(s) return tostring(s or ""):gsub("[\t\r\n]", " ") end
+    for _, e in ipairs(entries) do
+        lines[#lines + 1] = table.concat({clean(e.name), clean(e.kind), clean(e.categoryPath), clean(e.displayName),
+            clean(e.route or ""), clean(e.lastResult or "UNTESTED"), clean(e.source), clean((e.item or "") .. " " .. (e.requirement or ""))}, "\t")
+    end
+    return table.concat(lines, "\n")
+end
+
+function M.new(class, parent, properties)
+    local object = Instance.new(class)
+    for key, value in pairs(properties or {}) do object[key] = value end
+    object.Parent = parent
+    return object
+end
+
+function M.round(object, radius)
+    M.new("UICorner", object, {CornerRadius = UDim.new(0, radius or 6)})
+end
+
+function M.label(parent, text, pos, size, textSize, color)
+    return M.new("TextLabel", parent, {BackgroundTransparency = 1, Text = text, Position = pos, Size = size,
+        Font = Enum.Font.Gotham, TextSize = textSize or 12, TextColor3 = color or M.colors.text,
+        TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd})
+end
+
+function M.button(parent, text, pos, size, callback, bucket)
+    local button = M.new("TextButton", parent, {Text = text, Position = pos, Size = size, BorderSizePixel = 0,
+        BackgroundColor3 = M.colors.row, TextColor3 = M.colors.text, Font = Enum.Font.GothamMedium,
+        TextSize = 12, AutoButtonColor = true})
+    M.round(button)
+    if callback then M.track(button.Activated:Connect(callback), bucket) end
+    return button
+end
+
+function M.showExport(mode)
+    M.modalMode = mode
+    M.ui.exportTitle.Text = mode == "log" and "Tool Miner log" or "Export all discoveries"
+    M.ui.exportBox.Text = M.export(mode)
+    M.ui.modal.Visible = true
+    for name, button in pairs(M.ui.exportModes) do button.BackgroundColor3 = name == mode and M.colors.active or M.colors.row end
+end
+
+function M.copy()
+    local copier = setclipboard or M.env.setclipboard
+    if type(copier) == "function" then
+        local ok = pcall(copier, M.ui.exportBox.Text)
+        if ok then M.ui.copy.Text = "Copied"; return end
+    end
+    M.ui.exportBox:CaptureFocus()
+    M.ui.exportBox.CursorPosition = #M.ui.exportBox.Text + 1
+    M.ui.exportBox.SelectionStart = 1
+    M.ui.copy.Text = "Press Ctrl+C"
+end
+
+function M.details()
+    if not M.ui or M.dead then return end
+    local entry = M.selected and M.byName and M.byName[M.selected]
+    if not entry then
+        M.ui.detailTitle.Text = "Select a tool"
+        M.ui.detailImage.Image = ""
+        M.ui.detailText.Text = "v5 adds Brookhaven's real player-to-player tool handoff route from the supplied place.\n\nPick a donor (Client2 works), select any normal tool, then use Handoff receive. This sends the same recipient acceptance action the stock client uses after another player offers a tool."
+        M.ui.get.Visible, M.ui.hold.Visible, M.ui.handoff.Visible, M.ui.remove.Visible = false, false, false, false
+        return
+    end
+    local owned, usable = M.inventory()
+    local state = owned[entry.name] and (usable[entry.name] and "In inventory" or "In StarterGear") or "Not in inventory"
+    local lines = {entry.name, "", "Type: " .. tostring(entry.kind or "Tool"),
+        "Category: " .. (entry.categoryPath or "General"), "Source: " .. tostring(entry.source or "Unknown"),
+        "Inventory: " .. state, "Route: " .. tostring(entry.route or "PickingTools"),
+        "Last request: " .. tostring(entry.lastResult or "UNTESTED"),
+        "Handoff donor: " .. tostring((M.resolveDonor() and M.resolveDonor().Name) or "none")}
+    if entry.gunSkin then lines[#lines + 1] = "Base gun: " .. tostring(entry.gunSkin) end
+    if entry.item then lines[#lines + 1] = "Linked item: " .. tostring(entry.item) end
+    if entry.filters and entry.filters ~= "" then lines[#lines + 1] = "Menu filters: " .. entry.filters end
+    if entry.requirement and entry.requirement ~= "" then lines[#lines + 1] = "Requirement: " .. entry.requirement end
+    if entry.hiddenUnlessUnlocked then lines[#lines + 1] = "Native menu hides this until unlocked." end
+    if entry.evidence then lines[#lines + 1] = "Evidence: " .. entry.evidence end
+    if entry.sources and #entry.sources > 1 then
+        lines[#lines + 1] = "\nFound by:"
+        for _, source in ipairs(entry.sources) do lines[#lines + 1] = "- " .. source end
+    end
+    if entry.observedPaths and #entry.observedPaths > 0 then
+        lines[#lines + 1] = "\nObserved paths:"
+        for _, path in ipairs(entry.observedPaths) do lines[#lines + 1] = path end
+    end
+    if entry.interactions and #entry.interactions > 0 then
+        lines[#lines + 1] = "\nLoaded native giver/prompt fallback: YES"
+    end
+    M.ui.detailTitle.Text = entry.displayName or entry.name
+    M.ui.detailImage.Image = entry.icon or ""
+    M.ui.detailText.Text = table.concat(lines, "\n")
+    M.ui.get.Visible = true
+    M.ui.hold.Visible = not entry.isCategory
+    M.ui.handoff.Visible = not entry.isCategory and entry.kind ~= "Gun skin"
+    M.ui.remove.Visible = not entry.isCategory and owned[entry.name] ~= nil
+    M.ui.get.Text = entry.isCategory and "Open category" or (owned[entry.name] and "Already owned" or "Get tool")
+    if M.busy and M.busy.name == entry.name then M.ui.get.Text = "Pending..." end
+end
+
+function M.render(resetScroll)
+    if not M.ui or M.dead then return end
+    local owned, matched = M.inventory(), {}
+    local nativeCount, extraCount, categoryCount, testedCount = 0, 0, 0, 0
+    for _, entry in ipairs(M.entries) do
+        if entry.isCategory then categoryCount += 1
+        elseif entry.catalog then nativeCount += 1
+        else extraCount += 1 end
+        if not entry.isCategory and entry.lastResult then testedCount += 1 end
+
+        local include = not entry.isCategory
+        if M.filter == "Native config" then include = entry.catalog and not entry.isCategory
+        elseif M.filter == "Extra mined" then include = not entry.catalog and not entry.isCategory
+        elseif M.filter == "Gun skins" then include = entry.kind == "Gun skin"
+        elseif M.filter == "Categories" then include = entry.isCategory
+        elseif M.filter == "In bag" then include = owned[entry.name] ~= nil end
+        if include and M.inCategory(entry, M.category, M.categories) and M.matches(entry, M.query) then matched[#matched + 1] = entry end
+    end
+    M.filtered = matched
+    local pages = math.max(1, math.ceil(#matched / M.pageSize))
+    M.page = math.clamp(M.page, 1, pages)
+    M.ui.subtitle.Text = string.format("%d tools total  /  %d native  /  %d extra mined  /  %d tested  |  %s", nativeCount + extraCount, nativeCount, extraCount, testedCount, M.coverage)
+    M.ui.category.Text = M.category ~= "" and ("Category: " .. M.category .. "  [clear]") or "Category: All  /  select Categories to browse"
+    M.ui.pages.Text = string.format("%d results  |  %d / %d", #matched, M.page, pages)
+    for name, button in pairs(M.ui.tabs) do button.BackgroundColor3 = name == M.filter and M.colors.active or M.colors.row end
+    M.disconnect(M.rows)
+    for _, child in ipairs(M.ui.list:GetChildren()) do if child:IsA("GuiObject") then child:Destroy() end end
+    local first = (M.page - 1) * M.pageSize + 1
+    for index = first, math.min(#matched, first + M.pageSize - 1) do
+        local entry = matched[index]
+        local row = M.button(M.ui.list, "", UDim2.fromOffset(0, 0), UDim2.new(1, -8, 0, 61), function()
+            M.selected = entry.name
+            M.render(false)
+        end, M.rows)
+        row.LayoutOrder = index
+        row.BackgroundColor3 = M.selected == entry.name and M.colors.active or M.colors.row
+        M.new("ImageLabel", row, {BackgroundTransparency=1, Size=UDim2.fromOffset(45,45), Position=UDim2.fromOffset(8,8), Image=entry.icon or "", ScaleType=Enum.ScaleType.Fit})
+        local title = M.label(row, entry.displayName or entry.name, UDim2.fromOffset(64,9), UDim2.new(1,-138,0,20), 13)
+        title.Font = Enum.Font.GothamMedium
+        M.label(row, entry.name .. "  /  " .. (entry.categoryPath or entry.kind or "Tool"), UDim2.fromOffset(64,33), UDim2.new(1,-80,0,16), 10, M.colors.muted)
+        local badge
+        if owned[entry.name] then badge = "IN BAG"
+        elseif entry.isCategory then badge = "FOLDER"
+        elseif entry.lastResult then badge = entry.lastResult
+        elseif entry.catalog then badge = "NATIVE"
+        else badge = "EXTRA" end
+        M.label(row, badge, UDim2.new(1,-86,0,12), UDim2.fromOffset(80,18), 9, owned[entry.name] and M.colors.good or M.colors.accent)
+    end
+    M.ui.empty.Visible = #matched == 0
+    M.ui.empty.Text = #M.entries == 0 and "Mining the complete tool union...\nOpen Log if loading fails." or "No results for this filter."
+    if resetScroll then M.ui.list.CanvasPosition = Vector2.new(0, 0) end
+    M.details()
+end
+
+function M.unload()
+    if M.dead then return end
+    M.dead = true
+    M.generation = M.generation + 1
+    M.disconnect(M.connections)
+    M.disconnect(M.rows)
+    local current = coroutine.running()
+    for thread in pairs(M.workers) do if thread ~= current then pcall(task.cancel, thread) end end
+    table.clear(M.workers)
+    if M.gui then M.gui:Destroy() end
+    if M.env.ToolMinerSpawnerUnload == M.unload then M.env.ToolMinerSpawnerUnload = nil end
+end
+
+function M.buildUI()
+    M.gui = M.new("ScreenGui", nil, {Name = "ToolMinerSpawner", ResetOnSpawn = false,
+        IgnoreGuiInset = true, DisplayOrder = 100, ZIndexBehavior = Enum.ZIndexBehavior.Sibling})
+    -- Keep the UI under PlayerGui. Some runtimes let the startup thread parent into
+    -- gethui/CoreGui but later worker threads cannot touch those Instances and throw
+    -- "lacking capability Plugin". PlayerGui avoids that capability split entirely.
+    local parented = pcall(function() M.gui.Parent = M.PlayerGui end)
+    if not parented then error("Tool Miner could not create its PlayerGui interface.") end
+    local U = {}
+    M.ui = U
+    U.main = M.new("Frame", M.gui, {Size = UDim2.fromOffset(920, 650), AnchorPoint = Vector2.new(0.5, 0.5),
+        Position = UDim2.fromScale(0.5, 0.5), BackgroundColor3 = M.colors.bg, BorderSizePixel = 0})
+    M.round(U.main, 10)
+    M.new("UIStroke", U.main, {Color = M.colors.line, Thickness = 1})
+    U.scale = M.new("UIScale", U.main, {Scale = 1})
+    U.header = M.new("Frame", U.main, {Size = UDim2.new(1, 0, 0, 63), BackgroundTransparency = 1, Active = true})
+    local title = M.label(U.header, "Tool Miner v5.1 - Player Handoff", UDim2.fromOffset(16, 10), UDim2.fromOffset(205, 24), 20)
+    title.Font = Enum.Font.GothamBold
+    U.subtitle = M.label(U.header, "Reading the live catalog...", UDim2.fromOffset(16, 39), UDim2.new(1, -30, 0, 18), 10, M.colors.muted)
+    U.refresh = M.button(U.header, "Re-mine all", UDim2.fromOffset(426, 9), UDim2.fromOffset(83, 28), M.mine)
+    U.scan = M.button(U.header, "Deep scan", UDim2.fromOffset(515, 9), UDim2.fromOffset(91, 28), M.scanWorld)
+    M.button(U.header, "Export", UDim2.fromOffset(612, 9), UDim2.fromOffset(72, 28), function() M.showExport("report") end)
+    M.button(U.header, "Log", UDim2.fromOffset(690, 9), UDim2.fromOffset(57, 28), function() M.showExport("log") end)
+    M.button(U.header, "Hide", UDim2.fromOffset(753, 9), UDim2.fromOffset(60, 28), function() U.main.Visible = false end)
+    M.button(U.header, "X", UDim2.fromOffset(866, 9), UDim2.fromOffset(36, 28), M.unload)
+    U.search = M.new("TextBox", U.main, {Position = UDim2.fromOffset(16, 72), Size = UDim2.new(1, -32, 0, 34),
+        BackgroundColor3 = M.colors.panel, BorderSizePixel = 0, Text = "", PlaceholderText = "Search every mined tool name, source, category, event item...",
+        PlaceholderColor3 = M.colors.muted, TextColor3 = M.colors.text, Font = Enum.Font.Gotham, TextSize = 13,
+        ClearTextOnFocus = false, TextXAlignment = Enum.TextXAlignment.Left})
+    M.round(U.search)
+    M.new("UIPadding", U.search, {PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 10)})
+    U.tabs = {}
+    for index, name in ipairs({"All tools", "Native config", "Extra mined", "Gun skins", "Categories", "In bag"}) do
+        U.tabs[name] = M.button(U.main, name, UDim2.fromOffset(16 + (index - 1) * 148, 116), UDim2.fromOffset(140, 29), function()
+            M.filter, M.page = name, 1
+            M.render(true)
+        end)
+    end
+    U.category = M.button(U.main, "Category: All", UDim2.fromOffset(16, 153), UDim2.fromOffset(554, 25), function()
+        M.category, M.page = "", 1
+        M.render(true)
+    end)
+    U.list = M.new("ScrollingFrame", U.main, {Position = UDim2.fromOffset(16, 187), Size = UDim2.fromOffset(554, 385),
+        BackgroundTransparency = 1, BorderSizePixel = 0, ScrollBarThickness = 4, ScrollBarImageColor3 = M.colors.accent,
+        CanvasSize = UDim2.fromOffset(0, 0), AutomaticCanvasSize = Enum.AutomaticSize.Y})
+    M.new("UIListLayout", U.list, {Padding = UDim.new(0, 5), SortOrder = Enum.SortOrder.LayoutOrder})
+    U.empty = M.label(U.main, "", UDim2.fromOffset(42, 255), UDim2.fromOffset(480, 80), 13, M.colors.muted)
+    U.empty.TextWrapped = true
+    U.pages = M.label(U.main, "", UDim2.fromOffset(17, 584), UDim2.fromOffset(300, 24), 11, M.colors.muted)
+    M.button(U.main, "Previous", UDim2.fromOffset(383, 580), UDim2.fromOffset(88, 29), function()
+        M.page = M.page - 1; M.render(true)
+    end)
+    M.button(U.main, "Next", UDim2.fromOffset(479, 580), UDim2.fromOffset(88, 29), function()
+        M.page = M.page + 1; M.render(true)
+    end)
+    U.detail = M.new("Frame", U.main, {Position = UDim2.fromOffset(585, 153), Size = UDim2.fromOffset(319, 456),
+        BackgroundColor3 = M.colors.panel, BorderSizePixel = 0})
+    M.round(U.detail)
+    U.detailImage = M.new("ImageLabel", U.detail, {Position = UDim2.fromOffset(13, 12), Size = UDim2.fromOffset(52, 52),
+        BackgroundTransparency = 1, Image = "", ScaleType = Enum.ScaleType.Fit})
+    U.detailTitle = M.label(U.detail, "Select a tool", UDim2.fromOffset(76, 16), UDim2.fromOffset(229, 40), 15)
+    U.detailTitle.TextWrapped = true
+    U.detailTitle.Font = Enum.Font.GothamBold
+    U.donor = M.button(U.detail, "Donor: scanning...", UDim2.fromOffset(13, 72), UDim2.fromOffset(292, 25), function()
+        M.cycleDonor(1)
+    end)
+    U.donor.TextSize = 10
+    U.donor.TextXAlignment = Enum.TextXAlignment.Left
+    M.new("UIPadding", U.donor, {PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8)})
+    local scroll = M.new("ScrollingFrame", U.detail, {Position = UDim2.fromOffset(13, 105), Size = UDim2.fromOffset(295, 255),
+        BackgroundTransparency = 1, BorderSizePixel = 0, CanvasSize = UDim2.fromOffset(0, 0),
+        AutomaticCanvasSize = Enum.AutomaticSize.Y, ScrollBarThickness = 3})
+    U.detailText = M.label(scroll, "", UDim2.fromOffset(0, 0), UDim2.new(1, -9, 0, 0), 12, M.colors.muted)
+    U.detailText.AutomaticSize = Enum.AutomaticSize.Y
+    U.detailText.TextWrapped = true
+    U.detailText.TextYAlignment = Enum.TextYAlignment.Top
+    U.detailText.TextTruncate = Enum.TextTruncate.None
+    U.get = M.button(U.detail, "Get tool", UDim2.fromOffset(13, 377), UDim2.fromOffset(142, 30), function()
+        M.act(M.byName and M.byName[M.selected], "get")
+    end)
+    U.get.BackgroundColor3 = M.colors.active
+    U.hold = M.button(U.detail, "Hold", UDim2.fromOffset(163, 377), UDim2.fromOffset(142, 30), function()
+        M.act(M.byName and M.byName[M.selected], "hold")
+    end)
+    U.handoff = M.button(U.detail, "Handoff receive", UDim2.fromOffset(13, 414), UDim2.fromOffset(142, 28), function()
+        M.handoff(M.byName and M.byName[M.selected], "get")
+    end)
+    U.handoff.BackgroundColor3 = M.colors.active
+    U.remove = M.button(U.detail, "Remove", UDim2.fromOffset(163, 414), UDim2.fromOffset(142, 28), function()
+        M.act(M.byName and M.byName[M.selected], "remove")
+    end)
+    U.remove.TextColor3 = M.colors.bad
+    U.status = M.label(U.main, "", UDim2.fromOffset(16, 617), UDim2.new(1, -32, 0, 23), 11, M.colors.muted)
+
+    U.modal = M.new("Frame", U.main, {Size = UDim2.fromScale(1, 1), BackgroundColor3 = M.colors.bg,
+        BorderSizePixel = 0, Visible = false, ZIndex = 20, Active = true})
+    M.round(U.modal, 10)
+    U.exportTitle = M.label(U.modal, "Export all discoveries", UDim2.fromOffset(16, 13), UDim2.fromOffset(600, 30), 18)
+    M.button(U.modal, "Back", UDim2.new(1, -98, 0, 13), UDim2.fromOffset(80, 30), function()
+        U.modal.Visible = false; M.modalMode = nil
+    end)
+    U.exportModes = {}
+    for index, item in ipairs({{"names", "Names"}, {"report", "Full report"}, {"json", "JSON + raw config"}, {"log", "Log"}}) do
+        U.exportModes[item[1]] = M.button(U.modal, item[2], UDim2.fromOffset(16 + (index - 1) * 170, 56), UDim2.fromOffset(161, 30), function()
+            U.copy.Text = "Copy"; M.showExport(item[1])
+        end)
+    end
+    U.copy = M.button(U.modal, "Copy", UDim2.new(1, -123, 0, 56), UDim2.fromOffset(107, 30), M.copy)
+    local exportScroll = M.new("ScrollingFrame", U.modal, {Position = UDim2.fromOffset(16, 99), Size = UDim2.new(1, -32, 1, -139),
+        BackgroundColor3 = M.colors.panel, BorderSizePixel = 0, CanvasSize = UDim2.fromOffset(0, 0),
+        AutomaticCanvasSize = Enum.AutomaticSize.Y, ScrollBarThickness = 5})
+    U.exportBox = M.new("TextBox", exportScroll, {Position = UDim2.fromOffset(8, 8), Size = UDim2.new(1, -21, 0, 32),
+        AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, Text = "", MultiLine = true,
+        ClearTextOnFocus = false, TextEditable = false, TextWrapped = true, Font = Enum.Font.Code, TextSize = 12,
+        TextColor3 = M.colors.text, TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top})
+    M.label(U.modal, "Exports include the full spawn union and each tool's last request result. Server unlock checks still apply.", UDim2.fromOffset(16, 617), UDim2.new(1, -32, 0, 22), 11, M.colors.muted)
+
+    M.track(U.search:GetPropertyChangedSignal("Text"):Connect(function()
+        M.query, M.page = U.search.Text, 1
+        M.render(true)
+    end))
+    M.track(M.Input.InputBegan:Connect(function(input, processed)
+        if input.KeyCode == Enum.KeyCode.RightShift and not processed and not M.Input:GetFocusedTextBox() then
+            U.main.Visible = not U.main.Visible
+        end
+    end))
+    local drag
+    M.track(U.header.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            drag = {input = input, start = input.Position, position = U.main.Position}
+        end
+    end))
+    M.track(M.Input.InputChanged:Connect(function(input)
+        if drag and (input.UserInputType == Enum.UserInputType.MouseMovement or input == drag.input) then
+            local delta = input.Position - drag.start
+            U.main.Position = UDim2.new(drag.position.X.Scale, drag.position.X.Offset + delta.X,
+                drag.position.Y.Scale, drag.position.Y.Offset + delta.Y)
+        end
+    end))
+    M.track(M.Input.InputEnded:Connect(function(input)
+        if drag and (input == drag.input or input.UserInputType == Enum.UserInputType.MouseButton1) then drag = nil end
+    end))
+    local function resize()
+        local camera = workspace.CurrentCamera
+        if camera then U.scale.Scale = math.clamp(math.min((camera.ViewportSize.X - 24) / 920, (camera.ViewportSize.Y - 24) / 650), 0.25, 1) end
+    end
+    local cameraConnection
+    local function bindCamera()
+        if cameraConnection then cameraConnection:Disconnect() end
+        if workspace.CurrentCamera then cameraConnection = M.track(workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(resize)) end
+        resize()
+    end
+    M.track(workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(bindCamera))
+    bindCamera()
+end
+
+M.buildUI()
+M.env.ToolMinerSpawnerUnload = M.unload
+M.refreshDonorButton()
+
+-- Log real incoming tool offers so the exact stock payload can be compared with the handoff probe.
+do
+    local handoffRemote = M.playerTrigRemote()
+    if handoffRemote then
+        M.track(handoffRemote.OnClientEvent:Connect(function(action, donor, icon, toolName)
+            if action == "ToolGiveToClient" then
+                M.lastIncomingOffer = {donor = donor, icon = icon, toolName = toolName, at = os.clock()}
+                local donorName = typeof(donor) == "Instance" and donor.Name or tostring(donor)
+                M.trace("Incoming native tool offer: donor=" .. donorName .. " tool=" .. tostring(toolName) .. " icon=" .. tostring(icon))
+                if typeof(donor) == "Instance" and donor:IsA("Player") then
+                    M.handoffDonorName = donor.Name
+                    M.refreshDonorButton()
+                end
+            end
+        end))
+    else
+        M.trace("Player handoff remote missing at startup: RE.1Playe1rTrigge1rEven1t")
+    end
+end
+
+M.track(M.Players.PlayerAdded:Connect(function() task.defer(M.refreshDonorButton) end))
+M.track(M.Players.PlayerRemoving:Connect(function(player)
+    if M.handoffDonorName == player.Name then M.handoffDonorName = nil end
+    task.defer(M.refreshDonorButton)
+end))
+
+M.render(true)
+M.trace("Tool Miner v" .. M.version .. " started. PlaceId=" .. tostring(game.PlaceId))
+M.trace("Capability fix active: PlayerGui-only UI + direct task.spawn workers + protected-module skips.")
+M.trace("Deep-scan fix active: raw table traversal avoids metatable Signal traps; stable normalized sorter enabled.")
+M.trace("Spawn Union layers: ToolsConfig + RemoteConfig tree + native UI + visible Tool instances + ToolGivers + dynamic configs + place-derived families + LightningHub-known names.")
+M.trace("Player handoff route: AcceptedToolToServer(toolName, donorPlayer) via RE.1Playe1rTrigge1rEven1t.")
+M.trace("Every normal tool can also be tested through Handoff receive using a real other player as donor identity.")
+
+-- Inventory changes update visible state; one small poll also catches GunName changes.
+M.spawn(function()
+    local previous = ""
+    while not M.dead do
+        local owned = M.inventory()
+        local names = {}
+        for name in pairs(owned) do names[#names + 1] = name end
+        table.sort(names)
+        local signature = table.concat(names, "\n")
+        if signature ~= previous then
+            previous = signature
+            for _, tool in pairs(owned) do M.observe(tool, "Your inventory") end
+            M.merge()
+        end
+        task.wait(0.7)
+    end
+end)
+
+-- Catch tools that stream/spawn after the initial deep scan without rescanning the whole place.
+local function watchRoot(root)
+    if not root then return end
+    M.track(root.DescendantAdded:Connect(function(object)
+        if M.dead then return end
+        if object:IsA("Tool") then
+            M.observe(object, "Spawned/streamed live")
+            M.merge()
+        elseif object:IsA("StringValue") then
+            local lower = object.Name:gsub("[^%w]", ""):lower()
+            if lower == "toolname" or lower == "toolid" then
+                M.inspectDiscoveryObject(object)
+                M.merge()
+            end
+        end
+    end))
+end
+watchRoot(workspace)
+watchRoot(M.RS)
+watchRoot(M.PlayerGui)
+
+M.mine()
